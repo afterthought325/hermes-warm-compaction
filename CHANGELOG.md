@@ -6,6 +6,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ### Fixed
 
+- Accept a Hermes interrupt row (`Operation interrupted: …`) as a new trailing row of the warm request instead of refusing the compaction with `history_changed`. A stopped or interrupted turn left that synthetic assistant row after the captured reply, which sent every later compaction to the fallback and discarded the cached prefix. A real assistant row that the capture never saw is still refused.
 - Keep the original history when an indivisible native replay block exceeds the compaction budget. Check the threshold, reply reserve, and unknown request overhead before accepting the new history.
 - Match Copilot hostnames at a domain boundary. A lookalike hostname no longer gets Copilot replay handling.
 - Accept trailing whitespace removal by Hermes from complete text strings, including `api_content`, without a false `source_transform_unsupported` fallback. Keep the captured request prefix unchanged.
