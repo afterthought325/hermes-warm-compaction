@@ -49,8 +49,29 @@ def _matches_reply(row: Any, reply: dict[str, Any]) -> bool:
     return calls == reply["tool_calls"] and text in (reply_text(attr(row, "content")), reply_text(api_content(row)))
 
 
+# Hermes appends a synthetic assistant row when a turn is stopped or an API call is interrupted:
+# "Operation interrupted: waiting for model response (…)", "Operation interrupted: handling API error (…)",
+# "Operation interrupted: retrying …", "Operation interrupted during retry (…)", and the closing row that
+# agent.message_sanitization.close_interrupted_tool_sequence adds after an interrupted tool tail. The row is
+# part of the history Hermes keeps, and it always comes after the captured request: the warm request can send
+# it as a new trailing row instead of refusing the compaction and losing the cached prefix.
+INTERRUPT_PREFIX = "Operation interrupted"
+
+
+def is_synthetic_interrupt(row: Any) -> bool:
+    """True for a Hermes interrupt row: an assistant row with no tool call whose text starts with the Hermes
+    interrupt prefix. A real assistant reply that used tools carries tool_calls; an interrupt row never does,
+    and a real assistant reply that does not match the prefix stays refused."""
+    if attr(row, "role") != "assistant" or tool_calls_of(row):
+        return False
+    text = api_content(row)
+    return isinstance(text, str) and text.startswith(INTERRUPT_PREFIX)
+
+
 def split_history(capture: dict[str, Any], messages: list) -> tuple[list, list]:
-    """Return (new rows, trailing user rows) after the captured rows. Refuse a changed history."""
+    """Return (new rows, trailing rows) after the captured rows. Refuse a changed history. Trailing rows are
+    user rows and Hermes interrupt rows (is_synthetic_interrupt): the interrupt row is a host marker, not a
+    model turn, and the warm request sends it with the other new rows."""
     digests = capture["digests"]
     count = len(digests)
     if len(messages) <= count or [row_digest(row) for row in messages[:count]] != digests:
@@ -71,7 +92,7 @@ def split_history(capture: dict[str, Any], messages: list) -> tuple[list, list]:
     if answered != expected:
         raise WarmRefusal("history_changed")
     trailing = rest[index:]
-    if any(attr(row, "role") != "user" for row in trailing):
+    if any(attr(row, "role") != "user" and not is_synthetic_interrupt(row) for row in trailing):
         raise WarmRefusal("history_changed")
     return rest[:index], trailing
 

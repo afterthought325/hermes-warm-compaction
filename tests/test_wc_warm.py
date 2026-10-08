@@ -8,8 +8,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from warm_compaction.rows import estimate_tokens
 from warm_compaction.warm import (
-    HANDOFF_MAX_TOKENS, HANDOFF_MIN_TOKENS, SAFETY, WarmRefusal, build_request, check_settings, ends_with_instruction,
-    fits, send, split_history, urllib_post, wire_row,
+    HANDOFF_MAX_TOKENS, HANDOFF_MIN_TOKENS, SAFETY, WarmRefusal, build_request, check_settings,
+    ends_with_instruction, fits, is_synthetic_interrupt, send, split_history, urllib_post, wire_row,
 )
 from wc_fixtures import ROUTE, assistant, capture_for, tool, user
 
@@ -29,6 +29,69 @@ class SplitHistoryTest(unittest.TestCase):
         new_rows, trailing = split_history(capture, messages)
         self.assertEqual([row["role"] for row in new_rows], ["assistant", "tool", "tool"])
         self.assertEqual(trailing, [user("u3")])
+
+    def test_trailing_interrupt_rows_are_accepted(self):
+        # Hermes appends a synthetic assistant row when a turn is stopped or an API call is interrupted. The row
+        # comes after the captured request, so the warm request can send it as a new row instead of refusing the
+        # compaction and losing the cached prefix.
+        rows = history()
+        cases = {
+            # A stopped call: the capture is the last completed request, and the interrupt row follows its reply
+            # and tool results.
+            "after the tool results": (assistant("", [("c1", "read", "{}")]),
+                                       [*rows, assistant("", [("c1", "read", "{}")]), tool("c1", "r1"),
+                                        assistant("Operation interrupted: waiting for model response (12.0s elapsed).")]),
+            "then a new user row": (assistant("", [("c1", "read", "{}")]),
+                                    [*rows, assistant("", [("c1", "read", "{}")]), tool("c1", "r1"),
+                                     assistant("Operation interrupted: waiting for model response (12.0s elapsed)."),
+                                     user("u3")]),
+            # The closing row that Hermes appends to a transcript that ends on a tool result.
+            "closed tool tail": (assistant("", [("c1", "read", "{}")]),
+                                 [*rows, assistant("", [("c1", "read", "{}")]), tool("c1", "r1"),
+                                  assistant("Operation interrupted.")]),
+            # A stopped call after a text reply: no tool row is expected.
+            "after a text reply": (assistant("the answer"),
+                                   [*rows, assistant("the answer"),
+                                    assistant("Operation interrupted: waiting for model response (12.0s elapsed).")]),
+            # The other Hermes interrupt texts (API error, retry, retry check, provider recovery).
+            "API error row": (assistant("the answer"),
+                              [*rows, assistant("the answer"),
+                               assistant("Operation interrupted: handling API error (timeout: read timed out).")]),
+            "retry row": (assistant("the answer"),
+                          [*rows, assistant("the answer"),
+                           assistant("Operation interrupted: retrying API call after error (retry 1/3).")]),
+            "retry-check row": (assistant("the answer"),
+                                [*rows, assistant("the answer"),
+                                 assistant("Operation interrupted during retry (empty response, attempt 2/3).")]),
+            "provider recovery row": (assistant("the answer"),
+                                      [*rows, assistant("the answer"),
+                                       assistant("Operation interrupted: waiting for the provider to recover (cycle 1/3).")]),
+            "several interrupt rows": (assistant("the answer"),
+                                       [*rows, assistant("the answer"),
+                                        assistant("Operation interrupted: retrying empty response from model (retry 1/2)."),
+                                        assistant("Operation interrupted: waiting for model response (12.0s elapsed).")]),
+        }
+        for label, (reply, messages) in cases.items():
+            with self.subTest(label):
+                new_rows, trailing = split_history(capture_for(rows, reply), messages)
+                self.assertTrue(trailing)
+                self.assertTrue(all(row["role"] == "user" or is_synthetic_interrupt(row) for row in trailing))
+
+    def test_interrupt_rows_do_not_accept_a_real_assistant_row(self):
+        rows = history()
+        reply = assistant("", [("c1", "read", "{}")])
+        capture = capture_for(rows, reply)
+        cases = {
+            "plain assistant row": [*rows, reply, tool("c1", "r1"), assistant("next")],
+            "interrupt text with a tool call": [*rows, reply, tool("c1", "r1"),
+                                                assistant("Operation interrupted.", [("c9", "read", "{}")])],
+            "interrupt text inside the row": [*rows, reply, tool("c1", "r1"),
+                                              assistant("Earlier: Operation interrupted. Then the model answered.")],
+        }
+        for label, messages in cases.items():
+            with self.subTest(label), self.assertRaises(WarmRefusal) as caught:
+                split_history(capture, messages)
+            self.assertEqual(caught.exception.code, "history_changed")
 
     def test_reply_match_ignores_think_and_outer_space(self):
         rows = history()
@@ -157,6 +220,20 @@ class BuildRequestTest(unittest.TestCase):
         self.assertFalse(ends_with_instruction({"role": "user", "content": "u3"}, INSTRUCTION))
         self.assertEqual((body["stream"], body["temperature"]), (False, 0.2))
         self.assertNotIn("stream_options", body)
+
+    def test_appended_interrupt_row_rides_with_the_new_rows(self):
+        # A stopped turn leaves a Hermes interrupt row after the captured reply. The warm request sends it as a
+        # new row (the captured prefix is unchanged) and the instruction still joins the last user row.
+        self.messages = [*self.rows, self.reply, tool("c1", "r1"),
+                         assistant("Operation interrupted: waiting for model response (12.0s elapsed)."), user("u3")]
+        body = self.build(capture_for(self.rows, self.reply))
+        sent = capture_for(self.rows, self.reply)["body"]["messages"]
+        self.assertEqual(json.dumps(body["messages"][: len(sent)]), json.dumps(sent))
+        self.assertEqual(body["messages"][len(sent):], [
+            wire_row(self.reply), wire_row(tool("c1", "r1")),
+            wire_row(assistant("Operation interrupted: waiting for model response (12.0s elapsed).")),
+            {"role": "user", "content": "u3\n\n" + INSTRUCTION}])
+        self.assertTrue(ends_with_instruction(body["messages"][-1], INSTRUCTION))
 
     def test_appended_assistant_rows_keep_reasoning_content_on_an_echo_route(self):
         # A thinking-mode route (DeepSeek, Kimi) needs reasoning_content on every assistant row. The captured
