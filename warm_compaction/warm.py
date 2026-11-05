@@ -5,6 +5,7 @@ from __future__ import annotations
 import collections
 import copy
 import json
+import logging
 import ssl
 import time
 import urllib.error
@@ -18,6 +19,8 @@ from .rows import (
     api_content, attr, compact_json, estimate_tokens, has_thought_signature, hermes_value, plain_text,
     reasoning_policy as _reasoning_policy, replay_details, reply_text, row_digest, tool_calls_of,
 )
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_RESERVE = 4096
 # The reply limit of the handoff. The instruction asks for at most 600 words; the upper limit leaves room for a
@@ -198,12 +201,23 @@ def check_source(body: dict[str, Any], history_rows: list, base_url: Any = None,
     sent = body["messages"]
     offset = len(sent) - len(history_rows)
     if offset < 0 or any(attr(row, "role") not in SYSTEM_ROLES for row in sent[:offset]):
+        lead = [attr(row, "role") for row in sent[:max(offset, 0)] if attr(row, "role") not in SYSTEM_ROLES][:5]
+        logger.warning("warm_compaction: source check1 failed offset=%s sent=%s stored=%s lead=%s",
+                       offset, len(sent), len(history_rows), lead)
         raise WarmRefusal("source_transform_unsupported")
-    if not all(_same_row(wire, row) for wire, row in zip(sent[offset:], history_rows)):
-        raise WarmRefusal("source_transform_unsupported")
+    for _i, (_w, _r) in enumerate(zip(sent[offset:], history_rows)):
+        if not _same_row(_w, _r):
+            sc = str(attr(_w, "content"))[:70].replace("\n", "\\n")
+            st = str(api_content(_r))[:70].replace("\n", "\\n")
+            tw = [[n, str(_arguments(a))[:50]] for _id, n, a in list(tool_calls_of(_w))[:2]]
+            tr = [[n, str(_arguments(a))[:50]] for _id, n, a in list(tool_calls_of(_r))[:2]]
+            logger.warning("warm_compaction: source check2 failed row=%s sent_role=%s stored_role=%s "
+                           "sc=[%s] st=[%s] tcw=%s tcr=%s",
+                           _i, attr(_w, "role"), attr(_r, "role"), sc, st, tw, tr)
+            raise WarmRefusal("source_transform_unsupported")
     # The replayed fields follow the captured request only: the new rows do not change what Hermes sent.
     echo = needs_reasoning_echo(body, [])
-    for wire, row in zip(sent[offset:], history_rows):
+    for _i, (wire, row) in enumerate(zip(sent[offset:], history_rows)):
         want = wire_row(row, echo, body.get("model"), base_url, native_type)
         # Hermes d4d2ab7b can send stored reasoning on local Chat Completions routes.
         # Accept this field only when the sent assistant text equals the stored text.
@@ -217,6 +231,13 @@ def check_source(body: dict[str, Any], history_rows: list, base_url: Any = None,
                 and reasoning is None):
             want.pop("reasoning_content", None)
         if not (_same_replay_fields(wire, want) and _no_extra_fields(wire, want)):
+            wk = sorted(k for k in (wire.keys() if isinstance(wire, dict) else vars(wire))
+                        if k not in ("role", "content")) if (
+                wire and (isinstance(wire, dict) or hasattr(wire, "__dict__"))) else []
+            ek = sorted(k for k in (want or {}) if k not in ("role", "content"))
+            logger.warning("warm_compaction: source check3 failed row=%s replay=%s noextra=%s "
+                           "wire_keys=%s want_keys=%s",
+                           _i, _same_replay_fields(wire, want), _no_extra_fields(wire, want), wk[:8], ek[:8])
             raise WarmRefusal("source_transform_unsupported")
 
 
